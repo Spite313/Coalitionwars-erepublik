@@ -11,6 +11,8 @@
 // @grant        GM_getValue
 // @connect      www.erepublik.com
 // @run-at       document-end
+// @updateURL    https://raw.githubusercontent.com/Spite313/Coalitionwars-erepublik/main/coalition-wars-airstrike-tracker.user.js
+// @downloadURL  https://raw.githubusercontent.com/Spite313/Coalitionwars-erepublik/main/coalition-wars-airstrike-tracker.user.js
 // ==/UserScript==
 
 (function () {
