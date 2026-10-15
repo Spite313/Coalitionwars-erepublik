@@ -47,9 +47,9 @@
     ]);
 
     const UK_REGIONS = [
-        "Scotland", "Northern Ireland", "Northwest of England", "Northeast of England",
+        "Scotland", "Northern Ireland", "North West of England", "North East of England",
         "Wales", "West Midlands", "East Midlands", "East of England",
-        "Southwest of England", "Southeast of England", "London"
+        "South West of England", "South East of England", "London", "Yorkshire & Humberside"
     ];
 
     const COUNTRY_NAMES = {
