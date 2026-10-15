@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         eRepublik - Coalition Wars + Airstrike Tracker
+// @name         eRepublik - Coalition Wars + Airstrike Tracker (with UK Regions)
 // @namespace    http://tampermonkey.net/
-// @version      4.1
-// @description  Coalition battles (with live scores) plus airstrike-law cooldown tracker. Floating box on desktop, docked panel on mobile.
+// @version      4.2
+// @description  Coalition battles, airstrike trackers, and live UK Region defense statuses.
 // @author       You
 // @match        https://www.erepublik.com/en
 // @match        https://www.erepublik.com/en/
@@ -11,8 +11,6 @@
 // @grant        GM_getValue
 // @connect      www.erepublik.com
 // @run-at       document-end
-// @updateURL    https://raw.githubusercontent.com/Spite313/Coalitionwars-erepublik/main/coalition-wars-airstrike-tracker.user.js
-// @downloadURL  https://raw.githubusercontent.com/Spite313/Coalitionwars-erepublik/main/coalition-wars-airstrike-tracker.user.js
 // ==/UserScript==
 
 (function () {
@@ -29,27 +27,30 @@
     }
 
     /******************************************************************
-     * CONFIGURATION - WARS
+     * CONFIGURATION - WARS & UK REGIONS
      ******************************************************************/
     const DEBUG = false;
     const DEBUG_BATTLE_ID = null;
 
     const REFRESH_MIN_MS = 4 * 60 * 1000;
     const REFRESH_MAX_MS = 6 * 60 * 1000;
-    // Bumped to v2 so old cached data without scores isn't reused
-    const CACHE_KEY = "cw-campaign-cache-v2";
+    
+    // Bumped to v3 for the new UK Region cache structure
+    const CACHE_KEY = "cw-campaign-cache-v3";
 
     const SIDE_1_IDS = new Set([
         "42", "79", "53", "29", "171", "65", "13", "61", "63", "50", "74", "41", "69"
-        // Bulgaria, N.Macedonia, Portugal, UK, Cuba, Serbia, Hungary, Slovenia,
-        // Croatia, Australia, Uruguay, Russia, Bosnia
     ]);
 
     const SIDE_2_IDS = new Set([
         "1", "72", "40", "166", "59", "24", "83", "38", "71", "164", "82", "43", "80", "44"
-        // Romania, Lithuania, Ukraine, UAE, Thailand, USA, Belarus, Sweden,
-        // Latvia, Saudi Arabia, Cyprus, Turkey, Montenegro, Greece
     ]);
+
+    const UK_REGIONS = [
+        "Scotland", "Northern Ireland", "Northwest of England", "Northeast of England",
+        "Wales", "West Midlands", "East Midlands", "East of England",
+        "Southwest of England", "Southeast of England", "London"
+    ];
 
     const COUNTRY_NAMES = {
         "1": "Romania", "9": "Brazil", "10": "Italy", "11": "France", "12": "Germany",
@@ -74,12 +75,9 @@
     /******************************************************************
      * CONFIGURATION - AIRSTRIKES
      ******************************************************************/
-    // Allies/enemies are taken from SIDE_1_IDS / SIDE_2_IDS above, plus these
-    // extras (Paraguay is on your ally list but not in the wars list).
     const AIR_EXTRA_SIDE_1 = ["75"];
     const AIR_EXTRA_SIDE_2 = [];
 
-    // country id -> URL name used on country-administration pages
     const AIR_SLUGS = {
         "42": "Bulgaria", "79": "North-Macedonia", "53": "Portugal", "29": "United-Kingdom",
         "171": "Cuba", "65": "Serbia", "13": "Hungary", "61": "Slovenia", "63": "Croatia",
@@ -90,12 +88,12 @@
         "164": "Saudi-Arabia", "82": "Cyprus", "43": "Turkey", "80": "Montenegro", "44": "Greece"
     };
 
-    const AIR_COOLDOWN_DAYS = 14;      // airstrike available this long after the law passed
-    const AIR_VOTE_HOURS = 24;         // vote lasts 24h; a passed law counts as passed at proposal + 24h
-    const AIR_MAX_PAGES = 8;           // max list pages scanned per country (10 laws per page)
-    const AIR_DELAY_MS = 1300;         // base pause between requests (+ random jitter)
-    const AIR_DAY_START_HOUR = 10;     // eRepublik day change, Bucharest local time
-    const AIR_EPOCH = [2007, 10, 21];  // eRepublik day 1 = 21 Nov 2007 (month is 0-based)
+    const AIR_COOLDOWN_DAYS = 14;
+    const AIR_VOTE_HOURS = 24;
+    const AIR_MAX_PAGES = 8;
+    const AIR_DELAY_MS = 1300;
+    const AIR_DAY_START_HOUR = 10;
+    const AIR_EPOCH = [2007, 10, 21];
     const AIR_STORE_RESULTS = "cw-air-results-v1";
     const AIR_STORE_UPDATED = "cw-air-updated-v1";
 
@@ -213,7 +211,6 @@
         return "Battle #" + (battleId || "?");
     }
 
-    // Battle-level score for one side (battle.inv.points / battle.def.points)
     function extractPoints(side) {
         if (!side || typeof side !== "object") return null;
         const n = Number(side.points);
@@ -381,10 +378,7 @@
             if (!battleId) continue;
             const attacker = extractAttacker(battle);
             const defender = extractDefender(battle);
-            if (!attacker || !defender) {
-                debug("Could not identify attacker/defender:", battle);
-                continue;
-            }
+            if (!attacker || !defender) continue;
             const attackerSide = checkSide(attacker.id);
             const defenderSide = checkSide(defender.id);
             const cross =
@@ -414,10 +408,7 @@
             if (!battleId) continue;
             const occupier = extractResistanceDefender(battle);
             const resistance = extractResistanceAttacker(battle);
-            if (!occupier && !resistance) {
-                debug("Resistance war found but neither side could be identified:", battle);
-                continue;
-            }
+            if (!occupier && !resistance) continue;
             const occupierSide = occupier ? checkSide(occupier.id) : 0;
             const resistanceSide = resistance ? checkSide(resistance.id) : 0;
             if (occupierSide !== 1 && occupierSide !== 2 && resistanceSide !== 1 && resistanceSide !== 2) continue;
@@ -430,10 +421,56 @@
                 resistanceSide,
                 defender: occupier ? occupier.name : "Unknown",
                 defendingSide: occupierSide,
-                // In RWs, inv = resistance side, def = occupier
                 resistancePoints: extractPoints(battle.inv),
                 occupierPoints: extractPoints(battle.def)
             });
+        }
+        return results;
+    }
+    
+    // NEW PARSER FOR UK REGIONS
+    function parseUKWars(battlesList) {
+        const results = {};
+        for (const battle of battlesList) {
+            if (!battle || typeof battle !== "object") continue;
+            const battleId = extractBattleId(battle);
+            if (!battleId) continue;
+
+            const region = extractRegionName(battle, battleId);
+            
+            // Check if this region matches our UK list
+            const matchedRegion = UK_REGIONS.find(r => r.toLowerCase() === String(region).toLowerCase());
+            if (!matchedRegion) continue;
+
+            const isRw = isResistanceWar(battle);
+            let attacker, defender, invPoints, defPoints;
+
+            if (isRw) {
+                const res = extractResistanceAttacker(battle);
+                const occ = extractResistanceDefender(battle);
+                attacker = res ? res.name : "Unknown";
+                defender = occ ? occ.name : "Unknown";
+                invPoints = extractPoints(battle.inv);
+                defPoints = extractPoints(battle.def);
+            } else {
+                const att = extractAttacker(battle);
+                const def = extractDefender(battle);
+                attacker = att ? att.name : "Unknown";
+                defender = def ? def.name : "Unknown";
+                invPoints = extractPoints(battle.inv);
+                defPoints = extractPoints(battle.def);
+            }
+
+            // Save object to our dictionary keyed by Region Name
+            results[matchedRegion] = {
+                id: battleId,
+                region: matchedRegion,
+                isRw: isRw,
+                attacker: attacker,
+                defender: defender,
+                invPoints: invPoints,
+                defPoints: defPoints
+            };
         }
         return results;
     }
@@ -452,7 +489,7 @@
     }
 
     /******************************************************************
-     * AIRSTRIKES - TIME HELPERS (Bucharest, DST-aware)
+     * AIRSTRIKES - TIME HELPERS & FETCHING
      ******************************************************************/
     const HOUR = 3600e3;
     const DAY = 864e5;
@@ -469,7 +506,6 @@
         return asUtc - (ms - (ms % 1000));
     }
 
-    // UTC ms at which eRepublik day n begins
     function dayStartMs(n) {
         const fakeLocal = Date.UTC(AIR_EPOCH[0], AIR_EPOCH[1], AIR_EPOCH[2] + n - 1, AIR_DAY_START_HOUR);
         let utc = fakeLocal - bucharestOffsetMs(fakeLocal);
@@ -495,16 +531,12 @@
         return m + "m";
     }
 
-    /******************************************************************
-     * AIRSTRIKES - FETCHING / PARSING
-     ******************************************************************/
     async function getDoc(url) {
         const r = await fetch(url, { credentials: "include" });
         if (!r.ok) throw new Error("HTTP " + r.status);
         return new DOMParser().parseFromString(await r.text(), "text/html");
     }
 
-    // Reads the law list table: each row has the law type, "Day N, HH:MM" and a status icon (alt text).
     function parseListRows(doc) {
         const rows = [];
         doc.querySelectorAll("tr").forEach(tr => {
@@ -532,32 +564,24 @@
     }
 
     async function scanCountry(slug) {
-        // Stop looking once laws are older than this: nothing older can still block an airstrike
         const cutoff = Date.now() - (AIR_COOLDOWN_DAYS + AIR_VOTE_HOURS / 24 + 1) * DAY;
         const seen = new Set();
-
         for (let page = 1; page <= AIR_MAX_PAGES; page++) {
             if (page > 1) await sleep(AIR_DELAY_MS + Math.random() * 500);
             const doc = await getDoc(`/en/country-administration/${slug}/${page}`);
             const rows = parseListRows(doc).filter(r => !seen.has(r.id));
-
             if (!rows.length) {
                 return page === 1 ? { error: "no laws found on list page" } : { none: true };
             }
-
             for (const r of rows) {
                 seen.add(r.id);
                 if (r.isAirstrike) return { id: r.id, status: r.status, proposed: r.proposed };
             }
-            // rows are newest-first: if the oldest law on this page is past the cutoff, no airstrike is blocking
             if (rows[rows.length - 1].proposed < cutoff) return { none: true };
         }
         return { error: "gave up scanning (too many laws)" };
     }
 
-    /******************************************************************
-     * AIRSTRIKES - STATE
-     ******************************************************************/
     let airResults = {};
     try { airResults = JSON.parse(safeGet(AIR_STORE_RESULTS, "{}")) || {}; } catch (e) { airResults = {}; }
     let airBusy = false;
@@ -643,8 +667,6 @@
         renderAir();
     }
 
-    // Airstrike data is only fetched when you tap the refresh button.
-    // This tick just re-renders so countdowns and the "updated X ago" label stay current.
     function airTick() {
         renderAir();
     }
@@ -661,7 +683,7 @@
         overlay.id = "coalition-wars-widget";
         overlay.innerHTML = `
             <div id="cw-header">
-                <span>⚔️ Coalition <span id="cw-version">v4.1</span></span>
+                <span>⚔️ Coalition <span id="cw-version">v4.2</span></span>
                 <span>
                     <span id="cw-refresh" title="Refresh this tab">🔄</span>
                     <span id="cw-collapse" title="Collapse / expand">▾</span>
@@ -669,13 +691,18 @@
             </div>
             <div id="cw-tabs">
                 <button class="cw-tab" data-tab="wars">⚔️ Wars</button>
+                <button class="cw-tab" data-tab="uk">🇬🇧 UK</button>
                 <button class="cw-tab" data-tab="air">✈️ Airstrikes</button>
             </div>
             <div id="cw-panel-wars" class="cw-panel">
                 <div id="cw-status">Starting...</div>
                 <div id="cw-content">Scanning active battlefields...</div>
             </div>
-            <div id="cw-panel-air" class="cw-panel">
+            <div id="cw-panel-uk" class="cw-panel cw-hidden">
+                <div id="cw-uk-status">Waiting for data...</div>
+                <div id="cw-uk-content">Scanning for UK regions...</div>
+            </div>
+            <div id="cw-panel-air" class="cw-panel cw-hidden">
                 <div id="cw-air-status">Loading...</div>
                 <div id="cw-air-content"></div>
             </div>
@@ -724,15 +751,15 @@
             .cw-panel.cw-hidden { display: none !important; }
             #coalition-wars-widget.cw-collapsed #cw-tabs,
             #coalition-wars-widget.cw-collapsed .cw-panel { display: none !important; }
-            #cw-status, #cw-air-status {
+            #cw-status, #cw-air-status, #cw-uk-status {
                 padding: 4px 8px !important; font-size: 9px !important; color: #81a1c1 !important;
                 border-bottom: 1px solid #3b4252 !important;
             }
-            .cw-docked #cw-status, .cw-docked #cw-air-status { font-size: 11px !important; padding: 6px 10px !important; }
-            #cw-content, #cw-air-content {
+            .cw-docked #cw-status, .cw-docked #cw-air-status, .cw-docked #cw-uk-status { font-size: 11px !important; padding: 6px 10px !important; }
+            #cw-content, #cw-air-content, #cw-uk-content {
                 padding: 6px !important; overflow-y: auto !important; max-height: 490px !important;
             }
-            .cw-docked #cw-content, .cw-docked #cw-air-content { max-height: 65vh !important; }
+            .cw-docked #cw-content, .cw-docked #cw-air-content, .cw-docked #cw-uk-content { max-height: 65vh !important; }
             .cw-section-title {
                 font-weight: bold !important; font-size: 11px !important; text-transform: uppercase !important;
                 color: #d8dee9 !important; padding: 5px 2px !important; margin-top: 4px !important;
@@ -740,9 +767,19 @@
             }
             .cw-war-card {
                 background: #232830 !important; margin: 4px 0 !important; padding: 7px 8px !important;
-                border-radius: 4px !important; border-left: 4px solid #d08770 !important;
+                border-radius: 4px !important; border-left: 4px solid #bf616a !important; /* Direct attack (Red) */
             }
-            .cw-war-card.rw { border-left-color: #ebcb8b !important; }
+            .cw-war-card.rw { border-left-color: #ebcb8b !important; } /* Resistance (Yellow) */
+            
+            /* Safe UK Region Slim Card */
+            .cw-safe-card {
+                background: #232830 !important; margin: 4px 0 !important; padding: 5px 8px !important;
+                border-radius: 4px !important; border-left: 4px solid #a3be8c !important;
+                display: flex !important; justify-content: space-between !important; align-items: center !important;
+            }
+            .cw-safe-name { color: #a3be8c !important; font-weight: bold !important; font-size: 11px !important; }
+            .cw-safe-label { color: #4c566a !important; font-size: 10px !important; }
+
             .cw-war-title {
                 font-weight: bold !important; color: #88c0d0 !important; margin-bottom: 4px !important;
                 display: block !important; text-decoration: none !important;
@@ -808,24 +845,20 @@
     }
 
     function setTab(tab) {
-        activeTab = tab === "air" ? "air" : "wars";
+        activeTab = (tab === "air" || tab === "uk") ? tab : "wars";
         safeSet("cw-active-tab", activeTab);
         document.querySelectorAll("#coalition-wars-widget .cw-tab").forEach(btn => {
             btn.classList.toggle("cw-active", btn.getAttribute("data-tab") === activeTab);
         });
         const wars = document.getElementById("cw-panel-wars");
         const air = document.getElementById("cw-panel-air");
+        const uk = document.getElementById("cw-panel-uk");
         if (wars) wars.classList.toggle("cw-hidden", activeTab !== "wars");
         if (air) air.classList.toggle("cw-hidden", activeTab !== "air");
+        if (uk) uk.classList.toggle("cw-hidden", activeTab !== "uk");
         if (activeTab === "air") renderAir();
     }
 
-    /*
-     * PLACEMENT
-     * Wide screens: floating box fixed to the top-right.
-     * Narrow screens (phones): docked at the top of the page content, pushing
-     * existing elements down instead of covering them.
-     */
     function setupPlacement(widget) {
         const mq = window.matchMedia(MOBILE_QUERY);
 
@@ -906,6 +939,11 @@
         const status = document.getElementById("cw-status");
         if (status) status.textContent = text;
     }
+    
+    function setUKStatus(text) {
+        const status = document.getElementById("cw-uk-status");
+        if (status) status.textContent = text;
+    }
 
     /******************************************************************
      * WARS - REFRESH SCHEDULING & CACHE
@@ -940,11 +978,11 @@
         }
     }
 
-    function writeCache(directWars, resistanceWars, battlesChecked) {
+    function writeCache(directWars, resistanceWars, ukWars, battlesChecked) {
         if (typeof GM_setValue !== "function") return;
         try {
             GM_setValue(CACHE_KEY, JSON.stringify({
-                timestamp: Date.now(), directWars, resistanceWars, battlesChecked
+                timestamp: Date.now(), directWars, resistanceWars, ukWars, battlesChecked
             }));
         } catch (error) {
             debug("Failed to write cache:", error);
@@ -958,7 +996,9 @@
             const ageSeconds = Math.round((now - cached.timestamp) / 1000);
             debug("Using cached campaign data,", ageSeconds, "seconds old");
             setStatus(`Loaded from cache (${ageSeconds}s old)`);
+            setUKStatus(`Loaded from cache (${ageSeconds}s old)`);
             renderWars(cached.directWars, cached.resistanceWars);
+            if (cached.ukWars) renderUKWars(cached.ukWars);
             scheduleNextRefresh(Math.max(getRandomInterval() - (now - cached.timestamp), 5000));
             return;
         }
@@ -979,6 +1019,7 @@
             contentDiv.innerHTML = '<span style="color:#d8dee9;">Filtering active fronts...</span>';
         }
         setStatus("Contacting eRepublik...");
+        setUKStatus("Contacting eRepublik...");
         debug("Requesting active campaigns...");
 
         GM_xmlhttpRequest({
@@ -987,7 +1028,6 @@
             headers: { "X-Requested-With": "XMLHttpRequest", "Accept": "application/json" },
 
             onload: function (response) {
-                debug("HTTP status:", response.status);
                 if (response.status < 200 || response.status >= 300) {
                     showError(`eRepublik returned HTTP ${response.status}.`);
                     scheduleNextRefresh();
@@ -998,57 +1038,28 @@
                 try {
                     data = JSON.parse(response.responseText);
                 } catch (error) {
-                    debug("JSON parse error:", error);
                     showError("eRepublik returned invalid JSON.");
                     scheduleNextRefresh();
                     return;
                 }
 
-                if (DEBUG) {
-                    console.group("[Coalition Wars] Raw campaign response");
-                    console.log(data);
-                    console.groupEnd();
-                }
-
                 const battlesList = getBattleArray(data);
-                debug("Campaigns/battles received:", battlesList.length);
-
-                if (DEBUG_BATTLE_ID) {
-                    const target = battlesList.find(b => extractBattleId(b) === String(DEBUG_BATTLE_ID));
-                    if (target) {
-                        console.group("[Coalition Wars] DEBUG_BATTLE_ID " + DEBUG_BATTLE_ID + " - RAW OBJECT");
-                        console.log(JSON.parse(JSON.stringify(target)));
-                        console.log("[Coalition Wars] RAW OBJECT (full JSON text, copy this):\n" + JSON.stringify(target, null, 2));
-                        console.groupEnd();
-                        console.group("[Coalition Wars] DEBUG_BATTLE_ID " + DEBUG_BATTLE_ID + " - WHAT OUR PARSER SEES");
-                        console.log("isResistanceWar():", isResistanceWar(target));
-                        console.log("extractAttacker():", extractAttacker(target));
-                        console.log("extractDefender():", extractDefender(target));
-                        console.log("extractResistanceDefender():", extractResistanceDefender(target));
-                        console.groupEnd();
-                    } else {
-                        console.warn(
-                            "[Coalition Wars] DEBUG_BATTLE_ID " + DEBUG_BATTLE_ID +
-                            " was NOT found in the parsed battle list. Raw top-level response keys:",
-                            data && typeof data === "object" ? Object.keys(data) : typeof data
-                        );
-                        console.log("[Coalition Wars] Full raw response:", data);
-                    }
-                }
-
+                
                 const directWars = uniqueByBattleId(parseDirectWars(battlesList));
                 const resistanceWars = uniqueByBattleId(parseResistanceWars(battlesList));
-
-                debug("Matching direct wars:", directWars);
-                debug("Matching resistance wars:", resistanceWars);
+                const ukWars = parseUKWars(battlesList);
 
                 setStatus(
                     `${battlesList.length} active campaigns checked • ` +
                     `${directWars.length + resistanceWars.length} matches`
                 );
+                
+                const ukActiveCount = Object.keys(ukWars).length;
+                setUKStatus(`Checked • ${ukActiveCount} UK region(s) under attack`);
 
                 renderWars(directWars, resistanceWars);
-                writeCache(directWars, resistanceWars, battlesList.length);
+                renderUKWars(ukWars);
+                writeCache(directWars, resistanceWars, ukWars, battlesList.length);
                 scheduleNextRefresh();
             },
 
@@ -1067,13 +1078,16 @@
 
     function showError(message) {
         setStatus("ERROR");
+        setUKStatus("ERROR");
         const contentDiv = document.getElementById("cw-content");
-        if (!contentDiv) return;
-        contentDiv.innerHTML = `<div class="cw-error">${escapeHTML(message)}</div>`;
+        const ukDiv = document.getElementById("cw-uk-content");
+        const errorHtml = `<div class="cw-error">${escapeHTML(message)}</div>`;
+        if (contentDiv) contentDiv.innerHTML = errorHtml;
+        if (ukDiv) ukDiv.innerHTML = errorHtml;
     }
 
     /******************************************************************
-     * WARS - RENDER
+     * WARS - RENDER (Main + UK)
      ******************************************************************/
     function renderWars(directWars, resistanceWars) {
         const contentDiv = document.getElementById("cw-content");
@@ -1124,18 +1138,44 @@
                     </div>`;
             }
         }
+        contentDiv.innerHTML = html;
+    }
+    
+    function renderUKWars(ukWarsMap) {
+        const contentDiv = document.getElementById("cw-uk-content");
+        if (!contentDiv) return;
 
-        if (DEBUG) {
-            html += `
-                <div class="cw-debug">
-                    <b>DEBUG</b><br>
-                    Side 1 countries: ${SIDE_1_IDS.size}<br>
-                    Side 2 countries: ${SIDE_2_IDS.size}<br>
-                    Direct matches: ${directWars.length}<br>
-                    RW matches: ${resistanceWars.length}
-                </div>`;
+        const score = v => (v === null || v === undefined) ? "–" : v;
+        let html = '<div class="cw-section-title">🇬🇧 UK Regions Status</div>';
+
+        for (const region of UK_REGIONS) {
+            const war = ukWarsMap[region];
+            if (war) {
+                // Under attack
+                const typeIcon = war.isRw ? "✊" : "⚔️";
+                const typeLabel = war.isRw ? "Resistance War" : "Direct Attack";
+                const borderClass = war.isRw ? "rw" : ""; // Existing CSS classes dictate color
+
+                html += `
+                    <div class="cw-war-card ${borderClass}">
+                        <a class="cw-war-title" href="/en/military/battlefield/${war.id}" target="_blank" rel="noopener noreferrer">
+                            ${region} <span style="color:#d8dee9; font-weight:normal; font-size:9px;">(${typeLabel})</span>
+                        </a>
+                        <div class="cw-matchup">
+                            <span class="cw-side2">${typeIcon} <b>${escapeHTML(war.attacker)}</b> <span class="cw-score">${score(war.invPoints)}</span></span>
+                            <span class="cw-vs">vs</span>
+                            <span class="cw-side1"><span class="cw-score">${score(war.defPoints)}</span> <b>${escapeHTML(war.defender)}</b> 🛡️</span>
+                        </div>
+                    </div>`;
+            } else {
+                // Safe
+                html += `
+                    <div class="cw-safe-card">
+                        <span class="cw-safe-name">🛡️ ${region}</span>
+                        <span class="cw-safe-label">Not Under Attack</span>
+                    </div>`;
+            }
         }
-
         contentDiv.innerHTML = html;
     }
 
