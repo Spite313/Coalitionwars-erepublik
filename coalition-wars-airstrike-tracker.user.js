@@ -88,7 +88,7 @@
         "164": "Saudi-Arabia", "82": "Cyprus", "43": "Turkey", "80": "Montenegro", "44": "Greece"
     };
 
-    const AIR_COOLDOWN_DAYS = 14;
+    const AIR_COOLDOWN_DAYS = 13;
     const AIR_VOTE_HOURS = 24;
     const AIR_MAX_PAGES = 8;
     const AIR_DELAY_MS = 1300;
