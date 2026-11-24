@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         eRepublik - Coalition Wars + Airstrike Tracker (with UK Regions)
+// @name         eRepublik - Coalition Wars + Airstrike Tracker (with UK Regions + War Map)
 // @namespace    http://tampermonkey.net/
-// @version      4.3
-// @description  Coalition battles, enemy rotations, airstrike trackers, and live UK Region defense statuses.
+// @version      5.0
+// @description  Coalition battles, enemy rotations, airstrike trackers, live UK Region defense statuses, and an interactive war map.
 // @author       You
 // @match        https://www.erepublik.com/en
 // @match        https://www.erepublik.com/en/
@@ -10,6 +10,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @connect      www.erepublik.com
+// @connect      erepublik.cartodb.com
 // @run-at       document-end
 // ==/UserScript==
 
@@ -35,8 +36,8 @@
     const REFRESH_MIN_MS = 4 * 60 * 1000;
     const REFRESH_MAX_MS = 6 * 60 * 1000;
 
-    // Bumped to v4 for the new Enemy Rotations cache structure
-    const CACHE_KEY = "cw-campaign-cache-v4";
+    // Bumped to v5: battles now also store regionId for the map
+    const CACHE_KEY = "cw-campaign-cache-v5";
 
     const SIDE_1_IDS = new Set([
         "42", "79", "53", "29", "171", "65", "13", "61", "63", "50", "74", "41", "69"
@@ -62,8 +63,8 @@
         "43": "Turkey", "44": "Greece", "45": "Japan", "47": "South Korea", "48": "India",
         "49": "Indonesia", "50": "Australia", "51": "South Africa", "52": "Moldova",
         "53": "Portugal", "54": "Ireland", "55": "Denmark", "56": "Iran", "57": "Pakistan",
-        "58": "Israel", "59": "Thailand", "61": "Slovenia", "63": "Croatia", "64": "Chile",
-        "65": "Serbia", "66": "Malaysia", "67": "Philippines", "68": "Singapore",
+        "58": "Israel", "59": "Thailand", "61": "Slovenia", "63": "Croatia",
+        "64": "Chile", "65": "Serbia", "66": "Malaysia", "67": "Philippines", "68": "Singapore",
         "69": "Bosnia", "70": "Estonia", "71": "Latvia", "72": "Lithuania",
         "73": "North Korea", "74": "Uruguay", "75": "Paraguay", "76": "Bolivia",
         "77": "Peru", "78": "Colombia", "79": "North Macedonia", "80": "Montenegro",
@@ -209,6 +210,18 @@
             }
         }
         return "Battle #" + (battleId || "?");
+    }
+
+    // NEW: region id (used to match battles to map shapes)
+    function extractRegionId(battle) {
+        if (!battle || typeof battle !== "object") return null;
+        const direct = firstDefined(battle.region_id, battle.regionId, battle.regionID);
+        if (direct !== null) return normaliseId(direct);
+        if (battle.region && typeof battle.region === "object") {
+            const nested = firstDefined(battle.region.id, battle.region.region_id, battle.region.regionId);
+            if (nested !== null) return normaliseId(nested);
+        }
+        return null;
     }
 
     function extractPoints(side) {
@@ -388,6 +401,7 @@
             results.push({
                 id: battleId,
                 region: extractRegionName(battle, battleId),
+                regionId: extractRegionId(battle),
                 invader: attacker.name,
                 defender: defender.name,
                 attackerSide,
@@ -415,6 +429,7 @@
             results.push({
                 id: battleId,
                 region: extractRegionName(battle, battleId),
+                regionId: extractRegionId(battle),
                 occupier: occupier ? occupier.name : "Unknown",
                 occupierSide,
                 resistance: resistance ? resistance.name : "Unknown",
@@ -449,6 +464,7 @@
             results.push({
                 id: battleId,
                 region: extractRegionName(battle, battleId),
+                regionId: extractRegionId(battle),
                 invader: attacker.name,
                 defender: defender.name,
                 invPoints,
@@ -495,6 +511,7 @@
             results[matchedRegion] = {
                 id: battleId,
                 region: matchedRegion,
+                regionId: extractRegionId(battle),
                 isRw: isRw,
                 attacker: attacker,
                 defender: defender,
@@ -702,6 +719,455 @@
     }
 
     /******************************************************************
+     * WAR MAP
+     ******************************************************************/
+    const MAP_CARTO = "https://erepublik.cartodb.com/api/v2/sql?q=";
+    const MAP_GEO_KEY = "cw-map-geo-v1";
+    const MAP_GEO_TTL = 7 * DAY;
+    const MAP_NS = "http://www.w3.org/2000/svg";
+
+    const MAP_COLOURS = {
+        direct: "#ff453a",
+        rw: "#ffd60a",
+        rot: "#bf5af2",
+        uk: "#ff9f0a"
+    };
+    const MAP_LABELS = {
+        direct: "⚔️ Direct coalition war",
+        rw: "✊ Resistance war",
+        rot: "🔄 Enemy rotation",
+        uk: "🇬🇧 UK region battle"
+    };
+
+    // Latest parsed battles (set after every fetch / cache load)
+    let latestWars = null;
+
+    let mapOverlay = null, mapSvg = null, mapRoot = null, mapPanel = null, mapStatusEl = null;
+    let mapPaths = {}, mapStatus = {}, mapNameIndex = {}, mapBattles = {};
+    let mapSelected = null, mapBuilt = false, mapOpen = false, mapMoved = false;
+    let mapView = { cx: 0, cy: 0, w: 1000 };
+
+    function mapNorm(s) {
+        return String(s || "").toLowerCase().replace(/&/g, "and").replace(/[^a-z0-9]/g, "");
+    }
+
+    function cartoGet(q) {
+        const url = MAP_CARTO + encodeURIComponent(q);
+        return fetch(url)
+            .then(r => {
+                if (!r.ok) throw new Error("Carto HTTP " + r.status);
+                return r.json();
+            })
+            .catch(err => new Promise((resolve, reject) => {
+                if (typeof GM_xmlhttpRequest !== "function") return reject(err);
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url,
+                    onload: r => {
+                        try { resolve(JSON.parse(r.responseText)); } catch (e) { reject(e); }
+                    },
+                    onerror: () => reject(err)
+                });
+            }));
+    }
+
+    // Web Mercator, scaled so the whole world is ~3600 units wide
+    function mapPx(lon) { return (lon + 180) * 10; }
+    function mapPy(lat) {
+        lat = Math.max(-80, Math.min(84, lat));
+        const m = Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2)) * 180 / Math.PI;
+        return -m * 10;
+    }
+    function mapGeomToPath(geom) {
+        const polys = geom.type === "Polygon" ? [geom.coordinates] : geom.coordinates;
+        let d = "";
+        for (const poly of polys) {
+            for (const ring of poly) {
+                d += "M" + ring.map(p => mapPx(p[0]).toFixed(1) + "," + mapPy(p[1]).toFixed(1)).join("L") + "Z";
+            }
+        }
+        return d;
+    }
+
+    async function mapLoadGeo() {
+        try {
+            const raw = safeGet(MAP_GEO_KEY, null);
+            if (raw) {
+                const c = JSON.parse(raw);
+                if (c && Date.now() - c.t < MAP_GEO_TTL && c.d) return c.d;
+            }
+        } catch (e) { /* ignore */ }
+
+        const j = await cartoGet(
+            "select region_id, ST_AsGeoJSON(ST_SimplifyPreserveTopology(the_geom, 0.05), 3) as g from regions"
+        );
+        const d = {};
+        (j.rows || []).forEach(r => {
+            if (r.g) d[r.region_id] = mapGeomToPath(JSON.parse(r.g));
+        });
+        safeSet(MAP_GEO_KEY, JSON.stringify({ t: Date.now(), d }));
+        return d;
+    }
+
+    async function mapLoadStatus() {
+        const j = await cartoGet(
+            "select region_id, region_name, current_country_id, current_country_name, " +
+            "original_country_id, original_country_name, population, resource_name from regions"
+        );
+        const m = {}, idx = {};
+        (j.rows || []).forEach(r => {
+            m[r.region_id] = r;
+            idx[mapNorm(r.region_name)] = String(r.region_id);
+        });
+        mapStatus = m;
+        mapNameIndex = idx;
+    }
+
+    // Turn the tracker's battle lists into { carto_region_id: battleInfo }
+    function mapBuildBattles() {
+        const byRegion = {};
+        const unmatched = [];
+        if (!latestWars) return { byRegion, unmatched };
+
+        const seenBattles = new Set();
+
+        const place = (info) => {
+            if (seenBattles.has(info.id)) return;
+            seenBattles.add(info.id);
+            let rid = null;
+            if (info.regionId && mapPaths[info.regionId]) rid = String(info.regionId);
+            else rid = mapNameIndex[mapNorm(info.region)] || null;
+            if (!rid || !mapPaths[rid]) {
+                unmatched.push(info.region);
+                return;
+            }
+            if (!byRegion[rid]) byRegion[rid] = info;
+        };
+
+        (latestWars.direct || []).forEach(w => place({
+            type: "direct", id: w.id, region: w.region, regionId: w.regionId,
+            attacker: w.invader, defender: w.defender,
+            aPts: w.invPoints, dPts: w.defPoints,
+            aSide: w.attackerSide, dSide: w.defenderSide
+        }));
+        (latestWars.rw || []).forEach(w => place({
+            type: "rw", id: w.id, region: w.region, regionId: w.regionId,
+            attacker: w.resistance, defender: w.occupier,
+            aPts: w.resistancePoints, dPts: w.occupierPoints,
+            aSide: w.resistanceSide, dSide: w.occupierSide
+        }));
+        (latestWars.rot || []).forEach(w => place({
+            type: "rot", id: w.id, region: w.region, regionId: w.regionId,
+            attacker: w.invader, defender: w.defender,
+            aPts: w.invPoints, dPts: w.defPoints,
+            aSide: 2, dSide: 2
+        }));
+        Object.values(latestWars.uk || {}).forEach(w => place({
+            type: "uk", id: w.id, region: w.region, regionId: w.regionId,
+            attacker: w.attacker, defender: w.defender,
+            aPts: w.invPoints, dPts: w.defPoints,
+            aSide: 0, dSide: 0, isRw: w.isRw
+        }));
+
+        return { byRegion, unmatched };
+    }
+
+    /* ---- view / gestures ---- */
+    function mapW() { return mapSvg.clientWidth || 1; }
+    function mapH() { return mapSvg.clientHeight || 1; }
+
+    function mapApplyView() {
+        const w = mapView.w, h = w * mapH() / mapW();
+        mapSvg.setAttribute("viewBox", `${mapView.cx - w / 2} ${mapView.cy - h / 2} ${w} ${h}`);
+    }
+
+    function mapZoomAt(x, y, f) {
+        const k0 = mapView.w / mapW();
+        const wx = mapView.cx + (x - mapW() / 2) * k0;
+        const wy = mapView.cy + (y - mapH() / 2) * k0;
+        mapView.w = Math.min(Math.max(mapView.w * f, 30), 8000);
+        const k1 = mapView.w / mapW();
+        mapView.cx = wx - (x - mapW() / 2) * k1;
+        mapView.cy = wy - (y - mapH() / 2) * k1;
+        mapApplyView();
+    }
+
+    function mapFit() {
+        const b = mapRoot.getBBox();
+        mapView.cx = b.x + b.width / 2;
+        mapView.cy = b.y + b.height / 2;
+        mapView.w = Math.max(b.width, b.height * mapW() / mapH()) * 1.04;
+        mapApplyView();
+    }
+
+    function mapAttachGestures() {
+        const ptrs = new Map();
+        let lastDist = 0, moveSum = 0;
+
+        mapSvg.addEventListener("pointerdown", e => {
+            ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+            lastDist = 0;
+            mapMoved = false;
+            if (ptrs.size === 1) moveSum = 0;
+        });
+
+        window.addEventListener("pointermove", e => {
+            const prev = ptrs.get(e.pointerId);
+            if (!prev) return;
+            const cur = { x: e.clientX, y: e.clientY };
+            ptrs.set(e.pointerId, cur);
+            if (ptrs.size === 1) {
+                const dx = cur.x - prev.x, dy = cur.y - prev.y;
+                moveSum += Math.abs(dx) + Math.abs(dy);
+                if (moveSum > 8) {
+                    mapMoved = true;
+                    const k = mapView.w / mapW();
+                    mapView.cx -= dx * k;
+                    mapView.cy -= dy * k;
+                    mapApplyView();
+                }
+            } else if (ptrs.size === 2) {
+                const [a, b] = [...ptrs.values()];
+                const dist = Math.hypot(a.x - b.x, a.y - b.y);
+                const r = mapSvg.getBoundingClientRect();
+                if (lastDist) mapZoomAt((a.x + b.x) / 2 - r.left, (a.y + b.y) / 2 - r.top, lastDist / dist);
+                lastDist = dist;
+                mapMoved = true;
+            }
+        });
+
+        const up = e => { ptrs.delete(e.pointerId); lastDist = 0; };
+        window.addEventListener("pointerup", up);
+        window.addEventListener("pointercancel", up);
+
+        mapSvg.addEventListener("wheel", e => {
+            e.preventDefault();
+            const r = mapSvg.getBoundingClientRect();
+            mapZoomAt(e.clientX - r.left, e.clientY - r.top, e.deltaY > 0 ? 1.18 : 1 / 1.18);
+        }, { passive: false });
+    }
+
+    /* ---- drawing ---- */
+    function mapPaint() {
+        const built = mapBuildBattles();
+        mapBattles = built.byRegion;
+
+        let count = 0;
+        Object.keys(mapPaths).forEach(id => {
+            const p = mapPaths[id];
+            const s = mapStatus[id];
+            const b = mapBattles[id];
+            const side = s ? checkSide(s.current_country_id) : 0;
+            let fill = side === 1 ? "#24505c" : side === 2 ? "#5a2a30" : "#2a3140";
+            if (b) { fill = MAP_COLOURS[b.type]; count++; }
+            p.setAttribute("fill", fill);
+            p.classList.toggle("bt", !!b);
+            if (b) mapRoot.appendChild(p);
+        });
+        if (mapSelected && mapPaths[mapSelected]) mapRoot.appendChild(mapPaths[mapSelected]);
+
+        // hover titles (once)
+        Object.keys(mapPaths).forEach(id => {
+            const s = mapStatus[id];
+            const p = mapPaths[id];
+            if (!s || p.firstChild) return;
+            const t = document.createElementNS(MAP_NS, "title");
+            t.textContent = s.region_name;
+            p.appendChild(t);
+        });
+
+        const un = built.unmatched;
+        mapStatusEl.textContent =
+            count + " battle region(s) mapped" +
+            (un.length ? " · " + un.length + " unmatched" : "") +
+            " · " + new Date().toLocaleTimeString();
+        mapUnmatched = un;
+
+        if (mapSelected) mapShow(mapSelected);
+        else mapShowSummary();
+    }
+
+    let mapUnmatched = [];
+
+    function mapAdd(parent, text, style) {
+        const d = document.createElement("div");
+        d.textContent = text;
+        if (style) d.style.cssText = style;
+        parent.appendChild(d);
+        return d;
+    }
+
+    function mapShowSummary() {
+        mapPanel.textContent = "";
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;flex-wrap:wrap;gap:6px 12px;margin-bottom:6px";
+        Object.keys(MAP_COLOURS).forEach(k => {
+            const chip = document.createElement("span");
+            chip.textContent = MAP_LABELS[k];
+            chip.style.cssText = "border-left:10px solid " + MAP_COLOURS[k] + ";padding-left:5px";
+            row.appendChild(chip);
+        });
+        mapPanel.appendChild(row);
+        mapAdd(mapPanel, "Tap a region for details.", "opacity:.7");
+        if (mapUnmatched.length) {
+            mapAdd(mapPanel, "Not matched to a map region: " + mapUnmatched.join(", "), "color:#ff9f0a;margin-top:6px");
+        }
+    }
+
+    function mapShow(id) {
+        if (mapSelected && mapPaths[mapSelected]) mapPaths[mapSelected].classList.remove("sel");
+        mapSelected = id;
+        mapPaths[id].classList.add("sel");
+        mapRoot.appendChild(mapPaths[id]);
+
+        const s = mapStatus[id] || {};
+        const b = mapBattles[id];
+
+        mapPanel.textContent = "";
+        mapAdd(mapPanel, s.region_name || ("Region " + id), "font-weight:700;font-size:15px;margin-bottom:4px");
+
+        if (b) {
+            mapAdd(mapPanel, MAP_LABELS[b.type] + (b.type === "uk" && b.isRw ? " (resistance)" : ""),
+                "color:" + MAP_COLOURS[b.type] + ";font-weight:700;margin-bottom:4px");
+            const sideColour = side => side === 1 ? "#88c0d0" : side === 2 ? "#bf616a" : "#e1e6ed";
+            const pts = v => (v === null || v === undefined) ? "–" : v;
+            const roleA = (b.type === "rw") ? "Resistance" : "Attacker";
+            const roleD = (b.type === "rw") ? "Occupier" : "Defender";
+            mapAdd(mapPanel, roleA + ": " + b.attacker + "  (" + pts(b.aPts) + ")", "color:" + sideColour(b.aSide));
+            mapAdd(mapPanel, roleD + ": " + b.defender + "  (" + pts(b.dPts) + ")", "color:" + sideColour(b.dSide));
+            const a = document.createElement("a");
+            a.href = "/en/military/battlefield/" + encodeURIComponent(b.id);
+            a.target = "_blank";
+            a.rel = "noopener noreferrer";
+            a.textContent = "Open battlefield →";
+            a.style.cssText = "color:#88c0d0;display:inline-block;margin:6px 0";
+            mapPanel.appendChild(a);
+        } else {
+            mapAdd(mapPanel, "No tracked battle here.", "opacity:.7;margin-bottom:4px");
+        }
+
+        mapAdd(mapPanel,
+            "Owner: " + (s.current_country_name || "?") +
+            (s.original_country_id !== undefined && s.original_country_id !== s.current_country_id
+                ? " (originally " + s.original_country_name + ")" : ""),
+            "margin-top:4px");
+        mapAdd(mapPanel, "Population: " + (s.population ?? "?") + "  ·  Resource: " + (s.resource_name || "–"));
+    }
+
+    function mapBuildShapes(geo) {
+        Object.keys(geo).forEach(id => {
+            const p = document.createElementNS(MAP_NS, "path");
+            p.setAttribute("d", geo[id]);
+            p.addEventListener("click", () => { if (!mapMoved) mapShow(id); });
+            mapRoot.appendChild(p);
+            mapPaths[id] = p;
+        });
+        mapBuilt = true;
+    }
+
+    function ensureMapUI() {
+        if (mapOverlay) return;
+
+        const style = document.createElement("style");
+        style.textContent = `
+            #cw-map { position: fixed; inset: 0; z-index: 10000000; background: #0b1220; color: #eee;
+                font: 13px system-ui, sans-serif; display: none; }
+            #cw-map .mbar { position: absolute; top: 0; left: 0; right: 0; height: 44px; display: flex;
+                align-items: center; gap: 6px; padding: 0 8px; background: #161f33; z-index: 2; }
+            #cw-map .mbar span { flex: 1; font-size: 11px; opacity: .7; overflow: hidden;
+                white-space: nowrap; text-overflow: ellipsis; }
+            #cw-map button { background: #2a3858; color: #fff; border: 1px solid #4a5a82;
+                border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+            #cw-map svg { position: absolute; top: 44px; left: 0; width: 100%;
+                height: calc(100% - 44px); touch-action: none; }
+            #cw-map path { fill-opacity: .92; stroke: #0b1220; stroke-width: .6;
+                vector-effect: non-scaling-stroke; cursor: pointer; }
+            #cw-map path.bt { stroke: #fff; stroke-width: 2; }
+            #cw-map path.sel { stroke: #ffffff; stroke-width: 3.5; }
+            #cw-map.only path:not(.bt) { opacity: .15; }
+            #cw-map .mzoom { position: absolute; right: 8px; top: 56px; display: flex;
+                flex-direction: column; gap: 6px; z-index: 2; }
+            #cw-map .mpanel { position: absolute; left: 0; right: 0; bottom: 0; max-height: 40%;
+                overflow: auto; padding: 10px 12px; background: rgba(22,31,51,.96); z-index: 2; }
+        `;
+        document.head.appendChild(style);
+
+        mapOverlay = document.createElement("div");
+        mapOverlay.id = "cw-map";
+        mapOverlay.innerHTML =
+            '<div class="mbar"><b>🗺️ War Map</b><span></span>' +
+            '<button data-a="refresh">Refresh</button>' +
+            '<button data-a="only">Wars only</button>' +
+            '<button data-a="close">✕</button></div>' +
+            '<svg xmlns="http://www.w3.org/2000/svg"><g></g></svg>' +
+            '<div class="mzoom"><button data-a="in">+</button><button data-a="out">−</button></div>' +
+            '<div class="mpanel"></div>';
+        document.body.appendChild(mapOverlay);
+
+        mapSvg = mapOverlay.querySelector("svg");
+        mapRoot = mapSvg.querySelector("g");
+        mapPanel = mapOverlay.querySelector(".mpanel");
+        mapStatusEl = mapOverlay.querySelector(".mbar span");
+        mapAttachGestures();
+
+        mapOverlay.addEventListener("click", e => {
+            const a = e.target && e.target.dataset && e.target.dataset.a;
+            if (!a) return;
+            if (a === "refresh") { mapRefreshAll(); }
+            else if (a === "only") mapOverlay.classList.toggle("only");
+            else if (a === "in") mapZoomAt(mapW() / 2, mapH() / 2, 1 / 1.4);
+            else if (a === "out") mapZoomAt(mapW() / 2, mapH() / 2, 1.4);
+            else if (a === "close") mapClose();
+        });
+    }
+
+    async function mapRefreshAll() {
+        mapStatusEl.textContent = "Refreshing...";
+        try {
+            await mapLoadStatus();
+            mapPaint();
+        } catch (e) {
+            mapStatusEl.textContent = "Error: " + e.message;
+        }
+        fetchActiveWars(); // re-renders the map again when battles arrive
+    }
+
+    async function mapOpenUI() {
+        ensureMapUI();
+        mapOverlay.style.display = "block";
+        mapOpen = true;
+
+        if (!mapBuilt) {
+            mapStatusEl.textContent = "Loading region shapes...";
+            try {
+                mapBuildShapes(await mapLoadGeo());
+                mapFit();
+            } catch (e) {
+                mapStatusEl.textContent = "Error: " + e.message;
+                return;
+            }
+        }
+
+        mapStatusEl.textContent = "Loading region data...";
+        try {
+            await mapLoadStatus();
+        } catch (e) {
+            mapStatusEl.textContent = "Error: " + e.message;
+            return;
+        }
+        mapPaint();
+    }
+
+    function mapClose() {
+        if (mapOverlay) mapOverlay.style.display = "none";
+        mapOpen = false;
+    }
+
+    function mapRepaintIfOpen() {
+        if (mapOpen && mapBuilt) mapPaint();
+    }
+
+    /******************************************************************
      * UI
      ******************************************************************/
     let activeTab = "wars";
@@ -713,8 +1179,9 @@
         overlay.id = "coalition-wars-widget";
         overlay.innerHTML = `
             <div id="cw-header">
-                <span>⚔️ Coalition <span id="cw-version">v4.3</span></span>
+                <span>⚔️ Coalition <span id="cw-version">v5.0</span></span>
                 <span>
+                    <span id="cw-map-btn" title="Open war map">🗺️</span>
                     <span id="cw-refresh" title="Refresh this tab">🔄</span>
                     <span id="cw-collapse" title="Collapse / expand">▾</span>
                 </span>
@@ -762,12 +1229,12 @@
             }
             .cw-docked #cw-header { font-size: 14px !important; padding: 10px !important; }
             #cw-version { color: #81a1c1 !important; font-size: 9px !important; font-weight: normal !important; }
-            #cw-refresh, #cw-collapse {
+            #cw-map-btn, #cw-refresh, #cw-collapse {
                 cursor: pointer !important; font-size: 15px !important; padding: 2px 8px !important;
                 user-select: none !important; -webkit-user-select: none !important;
             }
-            .cw-docked #cw-refresh, .cw-docked #cw-collapse { font-size: 19px !important; padding: 4px 12px !important; }
-            #cw-refresh:hover, #cw-collapse:hover { opacity: 0.8 !important; }
+            .cw-docked #cw-map-btn, .cw-docked #cw-refresh, .cw-docked #cw-collapse { font-size: 19px !important; padding: 4px 12px !important; }
+            #cw-map-btn:hover, #cw-refresh:hover, #cw-collapse:hover { opacity: 0.8 !important; }
             #cw-tabs { display: flex !important; border-bottom: 1px solid #3b4252 !important; }
             .cw-tab {
                 flex: 1 !important; background: #232830 !important; color: #81a1c1 !important;
@@ -860,6 +1327,8 @@
             else fetchActiveWars();
         });
 
+        document.getElementById("cw-map-btn").addEventListener("click", mapOpenUI);
+
         document.getElementById("cw-collapse").addEventListener("click", () => {
             const collapsed = overlay.classList.toggle("cw-collapsed");
             safeSet("cw-collapsed", collapsed ? "1" : "0");
@@ -942,7 +1411,7 @@
         header.style.cursor = "move";
 
         header.addEventListener("pointerdown", e => {
-            if (mq.matches || e.button !== 0 || e.target.closest("#cw-refresh, #cw-collapse")) return;
+            if (mq.matches || e.button !== 0 || e.target.closest("#cw-map-btn, #cw-refresh, #cw-collapse")) return;
             const rect = widget.getBoundingClientRect();
             const dx = e.clientX - rect.left;
             const dy = e.clientY - rect.top;
@@ -1030,6 +1499,12 @@
             setUKStatus(`Loaded from cache (${ageSeconds}s old)`);
             renderWars(cached.directWars, cached.resistanceWars, cached.rotationWars || []);
             if (cached.ukWars) renderUKWars(cached.ukWars);
+            latestWars = {
+                direct: cached.directWars,
+                rw: cached.resistanceWars,
+                rot: cached.rotationWars || [],
+                uk: cached.ukWars || {}
+            };
             scheduleNextRefresh(Math.max(getRandomInterval() - (now - cached.timestamp), 5000));
             return;
         }
@@ -1092,6 +1567,10 @@
                 renderWars(directWars, resistanceWars, rotationWars);
                 renderUKWars(ukWars);
                 writeCache(directWars, resistanceWars, ukWars, rotationWars, battlesList.length);
+
+                latestWars = { direct: directWars, rw: resistanceWars, rot: rotationWars, uk: ukWars };
+                mapRepaintIfOpen();
+
                 scheduleNextRefresh();
             },
 
