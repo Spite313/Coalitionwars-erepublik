@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         eRepublik - Coalition Wars + Airstrike Tracker (with UK Regions)
 // @namespace    http://tampermonkey.net/
-// @version      4.2
-// @description  Coalition battles, airstrike trackers, and live UK Region defense statuses.
+// @version      4.3
+// @description  Coalition battles, enemy rotations, airstrike trackers, and live UK Region defense statuses.
 // @author       You
 // @match        https://www.erepublik.com/en
 // @match        https://www.erepublik.com/en/
@@ -34,9 +34,9 @@
 
     const REFRESH_MIN_MS = 4 * 60 * 1000;
     const REFRESH_MAX_MS = 6 * 60 * 1000;
-    
-    // Bumped to v3 for the new UK Region cache structure
-    const CACHE_KEY = "cw-campaign-cache-v3";
+
+    // Bumped to v4 for the new Enemy Rotations cache structure
+    const CACHE_KEY = "cw-campaign-cache-v4";
 
     const SIDE_1_IDS = new Set([
         "42", "79", "53", "29", "171", "65", "13", "61", "63", "50", "74", "41", "69"
@@ -427,8 +427,38 @@
         }
         return results;
     }
-    
-    // NEW PARSER FOR UK REGIONS
+
+    // ENEMY ROTATIONS: Side 2 attacking Side 2, attacker tied or ahead on points
+    function parseEnemyRotations(battlesList) {
+        const results = [];
+        for (const battle of battlesList) {
+            if (!battle || typeof battle !== "object") continue;
+            if (isResistanceWar(battle)) continue;
+            const battleId = extractBattleId(battle);
+            if (!battleId) continue;
+            const attacker = extractAttacker(battle);
+            const defender = extractDefender(battle);
+            if (!attacker || !defender) continue;
+            if (checkSide(attacker.id) !== 2 || checkSide(defender.id) !== 2) continue;
+
+            const invPoints = extractPoints(battle.inv);
+            const defPoints = extractPoints(battle.def);
+            if (invPoints === null || defPoints === null) continue;
+            if (invPoints < defPoints) continue; // attacker must be tied or winning
+
+            results.push({
+                id: battleId,
+                region: extractRegionName(battle, battleId),
+                invader: attacker.name,
+                defender: defender.name,
+                invPoints,
+                defPoints
+            });
+        }
+        return results;
+    }
+
+    // PARSER FOR UK REGIONS
     function parseUKWars(battlesList) {
         const results = {};
         for (const battle of battlesList) {
@@ -437,7 +467,7 @@
             if (!battleId) continue;
 
             const region = extractRegionName(battle, battleId);
-            
+
             // Check if this region matches our UK list
             const matchedRegion = UK_REGIONS.find(r => r.toLowerCase() === String(region).toLowerCase());
             if (!matchedRegion) continue;
@@ -683,7 +713,7 @@
         overlay.id = "coalition-wars-widget";
         overlay.innerHTML = `
             <div id="cw-header">
-                <span>⚔️ Coalition <span id="cw-version">v4.2</span></span>
+                <span>⚔️ Coalition <span id="cw-version">v4.3</span></span>
                 <span>
                     <span id="cw-refresh" title="Refresh this tab">🔄</span>
                     <span id="cw-collapse" title="Collapse / expand">▾</span>
@@ -770,7 +800,8 @@
                 border-radius: 4px !important; border-left: 4px solid #bf616a !important; /* Direct attack (Red) */
             }
             .cw-war-card.rw { border-left-color: #ebcb8b !important; } /* Resistance (Yellow) */
-            
+            .cw-war-card.rot { border-left-color: #b48ead !important; } /* Rotation (Purple) */
+
             /* Safe UK Region Slim Card */
             .cw-safe-card {
                 background: #232830 !important; margin: 4px 0 !important; padding: 5px 8px !important;
@@ -939,7 +970,7 @@
         const status = document.getElementById("cw-status");
         if (status) status.textContent = text;
     }
-    
+
     function setUKStatus(text) {
         const status = document.getElementById("cw-uk-status");
         if (status) status.textContent = text;
@@ -978,11 +1009,11 @@
         }
     }
 
-    function writeCache(directWars, resistanceWars, ukWars, battlesChecked) {
+    function writeCache(directWars, resistanceWars, ukWars, rotationWars, battlesChecked) {
         if (typeof GM_setValue !== "function") return;
         try {
             GM_setValue(CACHE_KEY, JSON.stringify({
-                timestamp: Date.now(), directWars, resistanceWars, ukWars, battlesChecked
+                timestamp: Date.now(), directWars, resistanceWars, ukWars, rotationWars, battlesChecked
             }));
         } catch (error) {
             debug("Failed to write cache:", error);
@@ -997,7 +1028,7 @@
             debug("Using cached campaign data,", ageSeconds, "seconds old");
             setStatus(`Loaded from cache (${ageSeconds}s old)`);
             setUKStatus(`Loaded from cache (${ageSeconds}s old)`);
-            renderWars(cached.directWars, cached.resistanceWars);
+            renderWars(cached.directWars, cached.resistanceWars, cached.rotationWars || []);
             if (cached.ukWars) renderUKWars(cached.ukWars);
             scheduleNextRefresh(Math.max(getRandomInterval() - (now - cached.timestamp), 5000));
             return;
@@ -1044,22 +1075,23 @@
                 }
 
                 const battlesList = getBattleArray(data);
-                
+
                 const directWars = uniqueByBattleId(parseDirectWars(battlesList));
                 const resistanceWars = uniqueByBattleId(parseResistanceWars(battlesList));
+                const rotationWars = uniqueByBattleId(parseEnemyRotations(battlesList));
                 const ukWars = parseUKWars(battlesList);
 
                 setStatus(
                     `${battlesList.length} active campaigns checked • ` +
-                    `${directWars.length + resistanceWars.length} matches`
+                    `${directWars.length + resistanceWars.length + rotationWars.length} matches`
                 );
-                
+
                 const ukActiveCount = Object.keys(ukWars).length;
                 setUKStatus(`Checked • ${ukActiveCount} UK region(s) under attack`);
 
-                renderWars(directWars, resistanceWars);
+                renderWars(directWars, resistanceWars, rotationWars);
                 renderUKWars(ukWars);
-                writeCache(directWars, resistanceWars, ukWars, battlesList.length);
+                writeCache(directWars, resistanceWars, ukWars, rotationWars, battlesList.length);
                 scheduleNextRefresh();
             },
 
@@ -1089,7 +1121,7 @@
     /******************************************************************
      * WARS - RENDER (Main + UK)
      ******************************************************************/
-    function renderWars(directWars, resistanceWars) {
+    function renderWars(directWars, resistanceWars, rotationWars = []) {
         const contentDiv = document.getElementById("cw-content");
         if (!contentDiv) return;
 
@@ -1138,9 +1170,30 @@
                     </div>`;
             }
         }
+
+        html += '<div class="cw-section-title">🔄 Enemy Rotations</div>';
+
+        if (rotationWars.length === 0) {
+            html += '<div class="cw-empty">No enemy vs enemy wars with the attacker tied or ahead.</div>';
+        } else {
+            for (const war of rotationWars) {
+                html += `
+                    <div class="cw-war-card rot">
+                        <a class="cw-war-title"
+                           href="/en/military/battlefield/${encodeURIComponent(war.id)}"
+                           target="_blank" rel="noopener noreferrer">${escapeHTML(war.region)}</a>
+                        <div class="cw-matchup">
+                            <span class="cw-side2">🔄 <b>${escapeHTML(war.invader)}</b> <span class="cw-score">${score(war.invPoints)}</span></span>
+                            <span class="cw-vs">vs</span>
+                            <span class="cw-side2"><span class="cw-score">${score(war.defPoints)}</span> <b>${escapeHTML(war.defender)}</b> 🛡️</span>
+                        </div>
+                    </div>`;
+            }
+        }
+
         contentDiv.innerHTML = html;
     }
-    
+
     function renderUKWars(ukWarsMap) {
         const contentDiv = document.getElementById("cw-uk-content");
         if (!contentDiv) return;
